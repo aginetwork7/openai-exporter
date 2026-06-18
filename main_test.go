@@ -591,7 +591,6 @@ func TestFetchCostData_SetsTodayCostMetric(t *testing.T) {
 		require.NoError(t, err)
 
 		val := gaugeVecValue(todayCostUSD, prometheus.Labels{
-			"date":            "2026-06-17",
 			"project_id":      "proj-123",
 			"project_name":    "demo-project",
 			"line_item":       "GPT-4 Turbo",
@@ -627,7 +626,6 @@ func TestFetchCostData_SetsTodayCostMetric(t *testing.T) {
 		require.NoError(t, err)
 
 		val := gaugeVecValue(todayCostUSD, prometheus.Labels{
-			"date":            "2026-06-17",
 			"project_id":      "proj-123",
 			"project_name":    "demo-project",
 			"line_item":       "GPT-4 Turbo",
@@ -642,7 +640,6 @@ func TestTodayCostGaugeVec(t *testing.T) {
 	todayCostUSD.Reset()
 
 	labels := prometheus.Labels{
-		"date":            "2026-06-17",
 		"project_id":      "proj-123",
 		"project_name":    "demo-project",
 		"line_item":       "GPT-4 Turbo",

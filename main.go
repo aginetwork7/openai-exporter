@@ -117,9 +117,9 @@ var (
 	todayCostUSD = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "openai_api_today_cost",
-			Help: "Today's spend by date/project/line_item/organization (currency indicated by label).",
+			Help: "Today's spend by project/line_item/organization (currency indicated by label).",
 		},
-		[]string{"date", "project_id", "project_name", "line_item", "organization_id", "currency"},
+		[]string{"project_id", "project_name", "line_item", "organization_id", "currency"},
 	)
 )
 
@@ -511,7 +511,6 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 					lineName = *res.LineItem
 				}
 				labels := prometheus.Labels{
-					"date":            date,
 					"project_id":      projectId,
 					"project_name":    e.ensureProjectName(projectId),
 					"line_item":       lineName,
