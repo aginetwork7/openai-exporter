@@ -18,7 +18,7 @@ This is an OpenAI Prometheus Exporter designed to fetch and expose usage data me
   - Audio Speeches
   - Audio Transcriptions
   - Vector Stores
-- Daily cost tracking with multi-currency support.
+- Current-day cost tracking with multi-currency support.
 
 ## Prerequisites
 
@@ -67,9 +67,8 @@ Use the following flags to customize the behavior:
 
 ### Cost Metrics Collection
 
-- Fetches daily cost data every 24 hours
-- Initial fetch covers the last 2 days
-- Groups costs by project with line-item breakdown
+- Fetches current-day cost data
+- Groups today's costs by project with line-item breakdown
 - Supports multiple currencies (indicated by the `currency` label)
 
 ### Project Name Enrichment
@@ -80,7 +79,7 @@ Use the following flags to customize the behavior:
 
 ## Metrics Examples
 
-The exporter provides two main metrics:
+The exporter provides two metrics:
 
 ### `openai_api_tokens_total`
 
@@ -96,17 +95,16 @@ Counter metric tracking token usage across all operations.
 - `batch`: Whether the request was batched (`true`/`false`)
 - `token_type`: Type of tokens (`input`, `output`, `input_cached`, `input_audio`, `output_audio`)
 
-### `openai_api_daily_cost`
+### `openai_api_today_cost`
 
-Gauge metric tracking daily costs per project.
+Gauge metric tracking today's costs per project.
 
 **Labels:**
-- `date`: Date in `YYYY-MM-DD` format
 - `project_id`: OpenAI project identifier
 - `project_name`: Human-readable project name (auto-resolved)
 - `line_item`: Cost line item description
 - `organization_id`: OpenAI organization identifier
-- `currency`: Currency code (e.g., `usd`)
+- `currency`: Currency code (for example, `usd`)
 
 ### Example Output
 
@@ -116,7 +114,7 @@ openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-0
 openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-09",operation="completions",project_id="",project_name="production",token_type="input_cached",user_id=""} 0
 openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-09",operation="completions",project_id="",project_name="production",token_type="output",user_id=""} 1432
 openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-09",operation="completions",project_id="",project_name="production",token_type="output_audio",user_id=""} 0
-openai_api_daily_cost{currency="usd",date="2024-01-15",line_item="GPT-4 Turbo",organization_id="org-123",project_id="proj-456",project_name="production"} 42.50
+openai_api_today_cost{currency="usd",line_item="GPT-4 Turbo",organization_id="org-123",project_id="proj-456",project_name="production"} 42.50
 ```
 
 ## Contributing

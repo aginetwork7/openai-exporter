@@ -9,9 +9,41 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// gaugeVecValue returns the current value of a GaugeVec for the given labels.
+func gaugeVecValue(gv *prometheus.GaugeVec, labels prometheus.Labels) float64 {
+	registry := prometheus.NewRegistry()
+	if err := registry.Register(gv); err != nil {
+		return 0
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		return 0
+	}
+	for _, family := range families {
+		for _, m := range family.GetMetric() {
+			got := labelsFromMetric(m)
+			if len(got) != len(labels) {
+				continue
+			}
+			match := true
+			for k, v := range labels {
+				if got[k] != v {
+					match = false
+					break
+				}
+			}
+			if match {
+				return m.GetGauge().GetValue()
+			}
+		}
+	}
+	return 0
+}
 
 func TestStringOrBool_UnmarshalJSON(t *testing.T) {
 	tests := []struct {
@@ -520,6 +552,143 @@ func TestFetchCostData_ErrorCases(t *testing.T) {
 		err := e.fetchCostData(1000, 2000)
 		assert.Error(t, err)
 	})
+}
+
+func TestFetchCostData_SetsTodayCostMetric(t *testing.T) {
+	projectNames = map[string]string{"proj-123": "demo-project"}
+	todayCostUSD.Reset()
+
+	fixedNow := time.Date(2026, time.June, 17, 12, 0, 0, 0, time.UTC)
+	originalNow := utcNow
+	utcNow = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		utcNow = originalNow
+	})
+
+	t.Run("sets today cost for today's bucket", func(t *testing.T) {
+		todayCostUSD.Reset()
+
+		bucketStart := fixedNow.Unix()
+		response := CostsList{
+			Object: "list",
+			Data: []CostBucket{{
+				StartTime: bucketStart,
+				EndTime:   bucketStart + 60,
+				Results: []CostResult{{
+					Amount: Money{
+						Value:    FloatOrString(12.34),
+						Currency: "usd",
+					},
+					LineItem:       strPtr("GPT-4 Turbo"),
+					ProjectID:      strPtr("proj-123"),
+					OrganizationID: "org-123",
+				}},
+			}},
+		}
+
+		e := newCostTestExporter(t, response)
+		err := e.fetchCostData(bucketStart-60, bucketStart+60)
+		require.NoError(t, err)
+
+		val := gaugeVecValue(todayCostUSD, prometheus.Labels{
+			"project_id":      "proj-123",
+			"project_name":    "demo-project",
+			"line_item":       "GPT-4 Turbo",
+			"organization_id": "org-123",
+			"currency":        "usd",
+		})
+		assert.InDelta(t, 12.34, val, 0.001)
+	})
+
+	t.Run("skips non-today buckets", func(t *testing.T) {
+		todayCostUSD.Reset()
+
+		yesterdayStart := fixedNow.Add(-24 * time.Hour).Unix()
+		response := CostsList{
+			Object: "list",
+			Data: []CostBucket{{
+				StartTime: yesterdayStart,
+				EndTime:   yesterdayStart + 60,
+				Results: []CostResult{{
+					Amount: Money{
+						Value:    FloatOrString(1.23),
+						Currency: "usd",
+					},
+					LineItem:       strPtr("GPT-4 Turbo"),
+					ProjectID:      strPtr("proj-123"),
+					OrganizationID: "org-123",
+				}},
+			}},
+		}
+
+		e := newCostTestExporter(t, response)
+		err := e.fetchCostData(yesterdayStart-60, yesterdayStart+60)
+		require.NoError(t, err)
+
+		val := gaugeVecValue(todayCostUSD, prometheus.Labels{
+			"project_id":      "proj-123",
+			"project_name":    "demo-project",
+			"line_item":       "GPT-4 Turbo",
+			"organization_id": "org-123",
+			"currency":        "usd",
+		})
+		assert.Equal(t, 0.0, val)
+	})
+}
+
+func TestTodayCostGaugeVec(t *testing.T) {
+	todayCostUSD.Reset()
+
+	labels := prometheus.Labels{
+		"project_id":      "proj-123",
+		"project_name":    "demo-project",
+		"line_item":       "GPT-4 Turbo",
+		"organization_id": "org-123",
+		"currency":        "usd",
+	}
+	todayCostUSD.With(labels).Set(42.5)
+
+	val := gaugeVecValue(todayCostUSD, labels)
+	assert.InDelta(t, 42.5, val, 0.001)
+}
+
+func newCostTestExporter(t *testing.T, response CostsList) *Exporter {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(response))
+	}))
+	t.Cleanup(server.Close)
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	return &Exporter{
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				cloned := req.Clone(req.Context())
+				cloned.URL.Scheme = serverURL.Scheme
+				cloned.URL.Host = serverURL.Host
+				return http.DefaultTransport.RoundTrip(cloned)
+			}),
+		},
+		apiKey: "test-key",
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func labelsFromMetric(metric *dto.Metric) map[string]string {
+	labels := make(map[string]string, len(metric.Label))
+	for _, label := range metric.Label {
+		labels[label.GetName()] = label.GetValue()
+	}
+	return labels
 }
 
 func strPtr(s string) *string {

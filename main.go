@@ -80,6 +80,7 @@ var (
 	lastScrape   = int64(0)
 	projectNames = make(map[string]string) // mapping project_id -> project_name
 	apiKeyNames  = make(map[string]string) // mapping api_key_id -> api_key_name
+	utcNow       = time.Now                // overridable for testing
 )
 
 // Prometheus Metric and CLI Flags
@@ -113,18 +114,18 @@ var (
 		},
 		[]string{"model", "operation", "project_id", "project_name", "user_id", "api_key_id", "api_key_name", "batch", "token_type"},
 	)
-	dailyCostUSD = prometheus.NewGaugeVec(
+	todayCostUSD = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "openai_api_daily_cost",
-			Help: "Daily spend by date/project/line_item/organization (currency indicated by label).",
+			Name: "openai_api_today_cost",
+			Help: "Today's spend by project/line_item/organization (currency indicated by label).",
 		},
-		[]string{"date", "project_id", "project_name", "line_item", "organization_id", "currency"},
+		[]string{"project_id", "project_name", "line_item", "organization_id", "currency"},
 	)
 )
 
 func init() {
 	prometheus.MustRegister(tokensTotal)
-	prometheus.MustRegister(dailyCostUSD)
+	prometheus.MustRegister(todayCostUSD)
 }
 
 func setupLogging() {
@@ -494,12 +495,15 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 			logrus.WithError(closeErr).Warn("failed to close response body")
 		}
 		logrus.Debugf("Received response: %+v", resp)
-
+		today := utcNow().UTC().Format("2006-01-02")
 		for _, bucket := range out.Data {
 			if len(bucket.Results) > 0 {
 				logrus.Debugf("Results %+v", bucket.Results)
 			}
 			date := time.Unix(bucket.StartTime, 0).UTC().Format("2006-01-02")
+			if date != today {
+				continue
+			}
 			for _, res := range bucket.Results {
 				projectId := deref(res.ProjectID)
 				lineName := "unknown"
@@ -507,14 +511,13 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 					lineName = *res.LineItem
 				}
 				labels := prometheus.Labels{
-					"date":            date,
 					"project_id":      projectId,
 					"project_name":    e.ensureProjectName(projectId),
 					"line_item":       lineName,
 					"organization_id": res.OrganizationID,
 					"currency":        res.Amount.Currency,
 				}
-				dailyCostUSD.With(labels).Set(float64(res.Amount.Value))
+				todayCostUSD.With(labels).Set(float64(res.Amount.Value))
 				logrus.Debugf("Processed result - Date: %s, ProjectID: %s, ProjectName: %s, LineItem: %s, OrganizationID: %s, Cost: %f, Currency: %s",
 					date, projectId, e.ensureProjectName(projectId), lineName, res.OrganizationID, res.Amount.Value, res.Amount.Currency)
 			}
@@ -552,7 +555,11 @@ func (e *Exporter) collect() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := e.fetchCostData(startTime, endTime+60*60*24); err != nil {
+			costStart := startTime
+			if twoDaysAgo := utcNow().Unix() - 2*24*60*60; costStart < twoDaysAgo {
+				costStart = twoDaysAgo
+			}
+			if err := e.fetchCostData(costStart, endTime+60*60*24); err != nil {
 				logrus.WithError(err).Warn("Error fetching cost data")
 			}
 		}()
