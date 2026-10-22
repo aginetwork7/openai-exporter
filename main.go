@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -81,7 +82,31 @@ var (
 	projectNames = make(map[string]string) // mapping project_id -> project_name
 	apiKeyNames  = make(map[string]string) // mapping api_key_id -> api_key_name
 	utcNow       = time.Now                // overridable for testing
+	// sleepCtx waits for d or until ctx is cancelled; overridable for testing with a fake clock.
+	sleepCtx = func(ctx context.Context, d time.Duration) error {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+
+	costMu sync.Mutex
+	// costDay is the UTC date (YYYY-MM-DD) whose spend todayCostUSD currently holds.
+	costDay string
 )
+
+// orgRateLimitPerMinute is the request limit observed on OpenAI organization endpoints
+// ("30 requests per 1 minute"). It is used to validate the catch-up throttle.
+const orgRateLimitPerMinute = 30
+
+// minUsageLoopSleep is the minimum pause between usage collection cycles. Each cycle either
+// advances lastScrape (bounded by scrape.max-catchup-windows) or sleeps, so even with a stuck or
+// jumping clock the loop can never spin on the API.
+const minUsageLoopSleep = time.Second
 
 // Prometheus Metric and CLI Flags
 
@@ -93,9 +118,17 @@ type UsageEndpoint struct {
 var (
 	listenAddress = flag.String("web.listen-address", ":9185", "Address to listen on for web interface and telemetry")
 	metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
-	// API polling interval; also used to determine the time window (last minute).
-	scrapeInterval = flag.Duration("scrape.interval", 1*time.Minute, "Interval for API calls and data window")
-	logLevel       = flag.String("log.level", "info", "Log level")
+	// API polling interval; also the size of each usage time window.
+	scrapeInterval = flag.Duration("scrape.interval", 1*time.Minute, "Interval for API calls and usage data window")
+	// Usage buckets can show up in the API a little after their minute has ended, so a window
+	// is only fetched once it has been closed for at least this long.
+	scrapeSettleDelay = flag.Duration("scrape.settle-delay", 1*time.Minute, "How long after a usage window has ended before it is fetched")
+	scrapeMaxCatchup  = flag.Int("scrape.max-catchup-windows", 60, "Maximum number of usage windows fetched in one collection cycle when behind")
+	// Every usage window costs one request per usage endpoint, so the spacing bounds the request rate while catching up.
+	scrapeCatchupSpacing = flag.Duration("scrape.catchup-spacing", 20*time.Second, "Minimum time between the starts of consecutive usage window fetches (rate-limit guard while catching up)")
+	costInterval         = flag.Duration("cost.interval", 5*time.Minute, "Interval for fetching today's cost")
+	httpTimeout          = flag.Duration("http.timeout", 30*time.Second, "Timeout for each OpenAI API request")
+	logLevel             = flag.String("log.level", "info", "Log level")
 
 	usageEndpoints = []UsageEndpoint{
 		{Path: "completions", Name: "completions"},
@@ -144,6 +177,8 @@ type Exporter struct {
 	client *http.Client
 	apiKey string
 	orgID  string
+	// lastWindowAt is when the most recent usage window fetch started; used to throttle catch-up.
+	lastWindowAt time.Time
 }
 
 type APIResponse struct {
@@ -220,7 +255,7 @@ func NewExporter() (*Exporter, error) {
 		return nil, fmt.Errorf("OPENAI_ORG_ID environment variable is not set")
 	}
 	return &Exporter{
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: &http.Client{Timeout: *httpTimeout},
 		apiKey: apiKey,
 		orgID:  orgID,
 	}, nil
@@ -252,7 +287,7 @@ func updateMetric(labels prometheus.Labels, tokenType string, bucketStart, bucke
 		tokenType,
 	}, "|")
 
-	now := time.Now().Unix()
+	now := utcNow().Unix()
 	// Update the metric only if the bucket is completed.
 	if bucketEnd > now {
 		logrus.Debugf("Bucket %s is not yet completed (bucketEnd: %d, now: %d), skipping", compositeKey, bucketEnd, now)
@@ -298,6 +333,10 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 		resp, err := e.client.Do(req)
 		if err != nil {
 			return fmt.Errorf("error fetching usage data: %w", err)
+		}
+		// Error bodies (e.g. 429 rate limit) decode into an empty page, so reject them explicitly.
+		if err := checkStatus(resp); err != nil {
+			return fmt.Errorf("error fetching usage data from %s: %w", endpoint.Path, err)
 		}
 
 		var response APIResponse
@@ -459,13 +498,24 @@ func deref(s *string) string {
 	return *s
 }
 
-// fetchCostData downloads information about the cost of projects
-func (e *Exporter) fetchCostData(startTime, endTime int64) error {
+// checkStatus returns an error (and drains the body) for non-2xx responses.
+func checkStatus(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	_ = resp.Body.Close()
+	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+}
+
+// fetchCostData downloads daily (bucket_width=1d) cost buckets grouped by project for [startTime, endTime).
+func (e *Exporter) fetchCostData(startTime, endTime int64) ([]CostBucket, error) {
 	baseURL := "https://api.openai.com/v1/organization/costs"
 	nextPage := ""
+	var buckets []CostBucket
 
 	for {
-		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&group_by=project_id",
+		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&bucket_width=1d&group_by=project_id",
 			baseURL, startTime, endTime)
 		if nextPage != "" {
 			url += "&page=" + nextPage
@@ -475,13 +525,16 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
-			return fmt.Errorf("failed to create request: %w", err)
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+e.apiKey)
 
 		resp, err := e.client.Do(req)
 		if err != nil {
-			return fmt.Errorf("error fetching cost data: %w", err)
+			return nil, fmt.Errorf("error fetching cost data: %w", err)
+		}
+		if err := checkStatus(resp); err != nil {
+			return nil, fmt.Errorf("error fetching cost data: %w", err)
 		}
 
 		var out CostsList
@@ -489,39 +542,13 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 		closeErr := resp.Body.Close()
 
 		if decodeErr != nil {
-			return fmt.Errorf("error decoding response: %w", decodeErr)
+			return nil, fmt.Errorf("error decoding response: %w", decodeErr)
 		}
 		if closeErr != nil {
 			logrus.WithError(closeErr).Warn("failed to close response body")
 		}
-		logrus.Debugf("Received response: %+v", resp)
-		today := utcNow().UTC().Format("2006-01-02")
-		for _, bucket := range out.Data {
-			if len(bucket.Results) > 0 {
-				logrus.Debugf("Results %+v", bucket.Results)
-			}
-			date := time.Unix(bucket.StartTime, 0).UTC().Format("2006-01-02")
-			if date != today {
-				continue
-			}
-			for _, res := range bucket.Results {
-				projectId := deref(res.ProjectID)
-				lineName := "unknown"
-				if res.LineItem != nil && *res.LineItem != "" {
-					lineName = *res.LineItem
-				}
-				labels := prometheus.Labels{
-					"project_id":      projectId,
-					"project_name":    e.ensureProjectName(projectId),
-					"line_item":       lineName,
-					"organization_id": res.OrganizationID,
-					"currency":        res.Amount.Currency,
-				}
-				todayCostUSD.With(labels).Set(float64(res.Amount.Value))
-				logrus.Debugf("Processed result - Date: %s, ProjectID: %s, ProjectName: %s, LineItem: %s, OrganizationID: %s, Cost: %f, Currency: %s",
-					date, projectId, e.ensureProjectName(projectId), lineName, res.OrganizationID, res.Amount.Value, res.Amount.Currency)
-			}
-		}
+		logrus.Debugf("Received response: %+v", out)
+		buckets = append(buckets, out.Data...)
 
 		if !out.HasMore {
 			break
@@ -529,43 +556,200 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 		nextPage = out.NextPage
 	}
 
+	return buckets, nil
+}
+
+// updateTodayCost fetches the current UTC day's cost bucket and publishes it in todayCostUSD.
+// The query window is always [today 00:00 UTC, now), independent of the usage collection window.
+// On error the gauge keeps its previous values. When the UTC day changes, the gauge vec is
+// reset before writing so projects that spent yesterday but not today disappear.
+func (e *Exporter) updateTodayCost() error {
+	now := utcNow().UTC()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	endTime := now.Unix()
+	if endTime <= dayStart.Unix() {
+		// Exactly at midnight: the API needs a non-empty range.
+		endTime = dayStart.Unix() + 1
+	}
+
+	buckets, err := e.fetchCostData(dayStart.Unix(), endTime)
+	if err != nil {
+		return err
+	}
+
+	type costPoint struct {
+		labels prometheus.Labels
+		value  float64
+	}
+	today := dayStart.Format("2006-01-02")
+	var points []costPoint
+	for _, bucket := range buckets {
+		date := time.Unix(bucket.StartTime, 0).UTC().Format("2006-01-02")
+		if date != today {
+			continue
+		}
+		for _, res := range bucket.Results {
+			projectId := deref(res.ProjectID)
+			lineName := "unknown"
+			if res.LineItem != nil && *res.LineItem != "" {
+				lineName = *res.LineItem
+			}
+			// Resolve names before touching the gauge so a Reset is not followed by slow lookups.
+			labels := prometheus.Labels{
+				"project_id":      projectId,
+				"project_name":    e.ensureProjectName(projectId),
+				"line_item":       lineName,
+				"organization_id": res.OrganizationID,
+				"currency":        res.Amount.Currency,
+			}
+			points = append(points, costPoint{labels: labels, value: float64(res.Amount.Value)})
+			logrus.Debugf("Processed result - Date: %s, ProjectID: %s, ProjectName: %s, LineItem: %s, OrganizationID: %s, Cost: %f, Currency: %s",
+				date, projectId, labels["project_name"], lineName, res.OrganizationID, res.Amount.Value, res.Amount.Currency)
+		}
+	}
+
+	costMu.Lock()
+	defer costMu.Unlock()
+	if costDay != today {
+		if costDay != "" {
+			logrus.Infof("UTC day changed from %s to %s, resetting %s", costDay, today, "openai_api_today_cost")
+		}
+		todayCostUSD.Reset()
+		costDay = today
+	}
+	for _, p := range points {
+		todayCostUSD.With(p.labels).Set(p.value)
+	}
 	return nil
 }
 
-// collect performs a loop to gather data for the last time window (one minute).
-// For each cycle, a time window is determined: from (current time - scrape.interval) to current time.
-func (e *Exporter) collect() {
-	stepSec := int64((*scrapeInterval) / time.Second)
+// collectCost refreshes today's cost every cost.interval until ctx is cancelled.
+func (e *Exporter) collectCost(ctx context.Context) {
 	for {
-		startTime := lastScrape
-		endTime := lastScrape + stepSec
-
-		logrus.Infof("Starting collection cycle: startTime=%d, endTime=%d", startTime, endTime)
-
-		var wg sync.WaitGroup
-		for _, endpoint := range usageEndpoints {
-			wg.Add(1)
-			go func(ep UsageEndpoint) {
-				defer wg.Done()
-				if err := e.fetchUsageData(ep, startTime, endTime); err != nil {
-					logrus.WithError(err).Errorf("Error fetching data from %s", ep.Path)
-				}
-			}(endpoint)
+		if err := e.updateTodayCost(); err != nil {
+			logrus.WithError(err).Warn("Error fetching cost data, keeping previous values")
 		}
+		if err := sleepCtx(ctx, *costInterval); err != nil {
+			return
+		}
+	}
+}
+
+// initialWindowStart returns the start of the first usage window to fetch after startup:
+// the most recent window that has already settled, so it is due immediately.
+func initialWindowStart(now time.Time) int64 {
+	return now.Add(-*scrapeSettleDelay).Truncate(*scrapeInterval).Add(-*scrapeInterval).Unix()
+}
+
+// catchupRequestsPerMinute is the worst-case usage request rate while catching up:
+// at most one window per scrape.catchup-spacing, each window hitting every usage endpoint once.
+func catchupRequestsPerMinute(spacing time.Duration) float64 {
+	return float64(len(usageEndpoints)) * float64(time.Minute) / float64(spacing)
+}
+
+// validateFlags checks the collection flags for values that would break the loops or the rate limit.
+func validateFlags() error {
+	if *scrapeInterval < time.Second || *scrapeInterval%time.Second != 0 {
+		return fmt.Errorf("-scrape.interval must be a whole number of seconds >= 1s, got %s", *scrapeInterval)
+	}
+	if *scrapeSettleDelay < 0 {
+		return fmt.Errorf("-scrape.settle-delay must not be negative, got %s", *scrapeSettleDelay)
+	}
+	if *scrapeMaxCatchup < 1 {
+		return fmt.Errorf("-scrape.max-catchup-windows must be >= 1, got %d", *scrapeMaxCatchup)
+	}
+	if *scrapeCatchupSpacing <= 0 || *scrapeCatchupSpacing > *scrapeInterval {
+		// A spacing above the interval would fetch windows slower than they are produced.
+		return fmt.Errorf("-scrape.catchup-spacing must be in (0, scrape.interval], got %s", *scrapeCatchupSpacing)
+	}
+	if *costInterval <= 0 {
+		return fmt.Errorf("-cost.interval must be positive, got %s", *costInterval)
+	}
+	if *httpTimeout <= 0 {
+		return fmt.Errorf("-http.timeout must be positive, got %s", *httpTimeout)
+	}
+	if rpm := catchupRequestsPerMinute(*scrapeCatchupSpacing); rpm > orgRateLimitPerMinute {
+		logrus.Warnf("-scrape.catchup-spacing=%s allows %.1f usage requests/min while catching up, above the %d/min organization rate limit",
+			*scrapeCatchupSpacing, rpm, orgRateLimitPerMinute)
+	}
+	return nil
+}
+
+// fetchUsageWindow fetches all usage endpoints concurrently for [startTime, endTime).
+// Per-endpoint errors are logged and the window is not retried.
+func (e *Exporter) fetchUsageWindow(startTime, endTime int64) {
+	logrus.Infof("Starting collection cycle: startTime=%d, endTime=%d", startTime, endTime)
+
+	var wg sync.WaitGroup
+	for _, endpoint := range usageEndpoints {
 		wg.Add(1)
-		go func() {
+		go func(ep UsageEndpoint) {
 			defer wg.Done()
-			costStart := startTime
-			if twoDaysAgo := utcNow().Unix() - 2*24*60*60; costStart < twoDaysAgo {
-				costStart = twoDaysAgo
+			if err := e.fetchUsageData(ep, startTime, endTime); err != nil {
+				logrus.WithError(err).Errorf("Error fetching data from %s", ep.Path)
 			}
-			if err := e.fetchCostData(costStart, endTime+60*60*24); err != nil {
-				logrus.WithError(err).Warn("Error fetching cost data")
+		}(endpoint)
+	}
+	wg.Wait()
+}
+
+// runUsageCycle fetches every usage window [lastScrape, lastScrape+step) that has settled
+// (window end <= now - scrape.settle-delay), oldest first, advancing lastScrape after each one.
+// At most scrape.max-catchup-windows windows are fetched, and window starts are spaced at
+// least scrape.catchup-spacing apart. Returns true when no settled window is left.
+func (e *Exporter) runUsageCycle(ctx context.Context) bool {
+	step := int64(*scrapeInterval / time.Second)
+	for n := 0; n < *scrapeMaxCatchup; n++ {
+		target := utcNow().Add(-*scrapeSettleDelay).Unix()
+		if lastScrape+step > target {
+			return true
+		}
+		if behind := (target - lastScrape) / step; behind > 1 && n == 0 {
+			logrus.Warnf("Usage collection is %d windows behind, catching up", behind)
+		}
+
+		// Throttle: keep window starts spaced so catch-up stays under the rate limit.
+		if !e.lastWindowAt.IsZero() {
+			if wait := e.lastWindowAt.Add(*scrapeCatchupSpacing).Sub(utcNow()); wait > 0 {
+				if err := sleepCtx(ctx, wait); err != nil {
+					return false
+				}
 			}
-		}()
-		wg.Wait()
-		lastScrape += stepSec
-		time.Sleep(*scrapeInterval)
+		}
+		e.lastWindowAt = utcNow()
+
+		e.fetchUsageWindow(lastScrape, lastScrape+step)
+		lastScrape += step
+	}
+	return lastScrape+step > utcNow().Add(-*scrapeSettleDelay).Unix()
+}
+
+// collectUsage keeps the usage window aligned to the wall clock. Instead of sleeping a fixed
+// interval after each fetch (which drifts by the fetch duration every cycle), it sleeps until the
+// next window becomes due, so lag never accumulates regardless of how long API calls take.
+func (e *Exporter) collectUsage(ctx context.Context) {
+	for ctx.Err() == nil {
+		caughtUp := e.runUsageCycle(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+
+		now := utcNow()
+		var wake time.Time
+		if caughtUp {
+			// The next window [lastScrape, lastScrape+step) is due once it has ended and settled.
+			wake = time.Unix(lastScrape, 0).Add(*scrapeInterval + *scrapeSettleDelay)
+		} else {
+			// Hit the per-cycle cap: pause until the next interval boundary before continuing.
+			wake = now.Truncate(*scrapeInterval).Add(*scrapeInterval)
+		}
+		d := wake.Sub(now)
+		if d < minUsageLoopSleep {
+			d = minUsageLoopSleep
+		}
+		if err := sleepCtx(ctx, d); err != nil {
+			return
+		}
 	}
 }
 
@@ -574,14 +758,19 @@ func (e *Exporter) collect() {
 func main() {
 	flag.Parse()
 	setupLogging()
+	if err := validateFlags(); err != nil {
+		logrus.Fatal(err)
+	}
 
-	lastScrape = time.Now().Round(time.Minute).Add(-*scrapeInterval).Unix()
+	lastScrape = initialWindowStart(utcNow())
 	exporter, err := NewExporter()
 	if err != nil {
 		logrus.Fatal(err)
 	}
 
-	go exporter.collect()
+	ctx := context.Background()
+	go exporter.collectUsage(ctx)
+	go exporter.collectCost(ctx)
 
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
