@@ -53,7 +53,12 @@ Use the following flags to customize the behavior:
 
 * `-web.listen-address`: Set the listen address for the web interface and telemetry (default: `:9185`).
 * `-web.telemetry-path`: Set the path under which to expose metrics (default: `/metrics`).
-* `-scrape.interval`: Set the interval for API calls and data collection (default: `1m`).
+* `-scrape.interval`: Set the interval for API calls and the size of each usage window (default: `1m`). Must be a whole number of seconds.
+* `-scrape.settle-delay`: How long after a usage window has ended before it is fetched, because OpenAI usage buckets keep growing for ~15-20 minutes after the minute ends and each window is fetched only once (default: `25m`; token metrics lag real time by about this much).
+* `-scrape.max-catchup-windows`: Maximum number of usage windows fetched in one collection cycle when the collector is behind (default: `60`).
+* `-scrape.catchup-spacing`: Minimum time between the starts of consecutive usage window fetches; keeps catch-up under the OpenAI rate limit (default: `20s`, must not exceed `-scrape.interval`).
+* `-cost.interval`: Interval for refreshing today's cost (default: `5m`).
+* `-http.timeout`: Timeout for each OpenAI API request (default: `30s`).
 * `-log.level`: Set the log verbosity (default: `info`).
 
 ## How It Works
@@ -61,13 +66,18 @@ Use the following flags to customize the behavior:
 ### Token Metrics Collection
 
 - Fetches usage data every minute (configurable via `-scrape.interval`)
+- Windows are aligned to the wall clock: a window `[t, t+interval)` is fetched once `now >= t + interval + settle-delay`, so the collector does not fall behind however long API calls take
+- If the collector is behind (slow API calls, outages), missed windows are fetched oldest first without waiting for the next interval, at most `-scrape.max-catchup-windows` per cycle and spaced by `-scrape.catchup-spacing`
+- Each window queries 7 usage endpoints. OpenAI organization endpoints are limited to about 30 requests per minute, so the default 20s spacing allows at most 3 windows (21 requests) per minute while catching up, leaving room for cost and name lookups
 - Collects data in 1-minute buckets with automatic deduplication
 - Aggregates metrics by model, operation, project, user, API key, and batch status
 - Only processes completed time buckets to ensure data accuracy
 
 ### Cost Metrics Collection
 
-- Fetches current-day cost data
+- Fetches current-day cost data every `-cost.interval`, independently of the usage windows: `start_time` is today 00:00 UTC, `end_time` is now, `bucket_width=1d`
+- Only today's UTC bucket is exported; at the UTC day change the metric is reset, so projects with no spend today disappear
+- If a cost request fails, the previous values are kept
 - Groups today's costs by project with line-item breakdown
 - Supports multiple currencies (indicated by the `currency` label)
 
