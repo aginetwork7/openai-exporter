@@ -111,9 +111,14 @@ const minUsageLoopSleep = time.Second
 // Prometheus Metric and CLI Flags
 
 type UsageEndpoint struct {
-	Path string // API endpoint path (e.g. "completions")
-	Name string // Name of the operation (e.g. "completions")
+	Path    string // API endpoint path (e.g. "completions")
+	Name    string // Name of the operation (e.g. "completions")
+	GroupBy string // group_by fields this endpoint accepts; the API rejects unknown ones with 400
 }
+
+// Fields accepted by most usage endpoints. Only completions also groups by batch, and
+// vector_stores only by project; asking for more fails the whole request.
+const defaultUsageGroupBy = "project_id,user_id,api_key_id,model"
 
 var (
 	listenAddress = flag.String("web.listen-address", ":9185", "Address to listen on for web interface and telemetry")
@@ -131,13 +136,13 @@ var (
 	logLevel             = flag.String("log.level", "info", "Log level")
 
 	usageEndpoints = []UsageEndpoint{
-		{Path: "completions", Name: "completions"},
-		{Path: "embeddings", Name: "embeddings"},
-		{Path: "moderations", Name: "moderations"},
-		{Path: "images", Name: "images"},
-		{Path: "audio_speeches", Name: "audio_speeches"},
-		{Path: "audio_transcriptions", Name: "audio_transcriptions"},
-		{Path: "vector_stores", Name: "vector_stores"},
+		{Path: "completions", Name: "completions", GroupBy: defaultUsageGroupBy + ",batch"},
+		{Path: "embeddings", Name: "embeddings", GroupBy: defaultUsageGroupBy},
+		{Path: "moderations", Name: "moderations", GroupBy: defaultUsageGroupBy},
+		{Path: "images", Name: "images", GroupBy: defaultUsageGroupBy},
+		{Path: "audio_speeches", Name: "audio_speeches", GroupBy: defaultUsageGroupBy},
+		{Path: "audio_transcriptions", Name: "audio_transcriptions", GroupBy: defaultUsageGroupBy},
+		{Path: "vector_stores", Name: "vector_stores", GroupBy: "project_id"},
 	}
 
 	tokensTotal = prometheus.NewCounterVec(
@@ -316,8 +321,12 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 	allResults := []UsageResult{}
 
 	for {
-		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&bucket_width=1m&limit=1440&group_by=project_id,user_id,api_key_id,model,batch",
-			baseURL, startTime, endTime)
+		groupBy := endpoint.GroupBy
+		if groupBy == "" {
+			groupBy = defaultUsageGroupBy
+		}
+		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&bucket_width=1m&limit=1440&group_by=%s",
+			baseURL, startTime, endTime, groupBy)
 		if nextPage != "" {
 			url += "&page=" + nextPage
 		}
@@ -566,11 +575,9 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) ([]CostBucket, error)
 func (e *Exporter) updateTodayCost() error {
 	now := utcNow().UTC()
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	endTime := now.Unix()
-	if endTime <= dayStart.Unix() {
-		// Exactly at midnight: the API needs a non-empty range.
-		endTime = dayStart.Unix() + 1
-	}
+	// The range must cover the whole 1d bucket: with end_time = now the costs API returns no
+	// bucket at all for the current day. The bucket still only holds spend up to now.
+	endTime := dayStart.Add(24 * time.Hour).Unix()
 
 	buckets, err := e.fetchCostData(dayStart.Unix(), endTime)
 	if err != nil {
@@ -583,11 +590,13 @@ func (e *Exporter) updateTodayCost() error {
 	}
 	today := dayStart.Format("2006-01-02")
 	var points []costPoint
+	foundToday := false
 	for _, bucket := range buckets {
 		date := time.Unix(bucket.StartTime, 0).UTC().Format("2006-01-02")
 		if date != today {
 			continue
 		}
+		foundToday = true
 		for _, res := range bucket.Results {
 			projectId := deref(res.ProjectID)
 			lineName := "unknown"
@@ -606,6 +615,12 @@ func (e *Exporter) updateTodayCost() error {
 			logrus.Debugf("Processed result - Date: %s, ProjectID: %s, ProjectName: %s, LineItem: %s, OrganizationID: %s, Cost: %f, Currency: %s",
 				date, projectId, labels["project_name"], lineName, res.OrganizationID, res.Amount.Value, res.Amount.Currency)
 		}
+	}
+
+	// No bucket for today means the response is unusable (not "zero spend": the API returns
+	// today's bucket with empty results then); keep the previous values instead of wiping them.
+	if !foundToday {
+		return fmt.Errorf("cost response has no bucket for %s (%d buckets)", today, len(buckets))
 	}
 
 	costMu.Lock()

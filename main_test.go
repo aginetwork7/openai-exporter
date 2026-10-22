@@ -626,7 +626,8 @@ func TestUpdateTodayCost_SetsTodayCostMetric(t *testing.T) {
 		}
 
 		e := newCostTestExporter(t, response)
-		require.NoError(t, e.updateTodayCost())
+		// Only yesterday's bucket: an unusable response, reported as an error, gauge untouched.
+		require.Error(t, e.updateTodayCost())
 
 		assert.Empty(t, gaugeVecSeries(todayCostUSD))
 	})
@@ -1200,28 +1201,49 @@ func setupCostTest(t *testing.T, now time.Time) (*fakeClock, *costServer, *Expor
 
 func TestUpdateTodayCost_QueryParams(t *testing.T) {
 	now := time.Date(2026, time.June, 17, 13, 45, 10, 0, time.UTC)
+	today := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
 	_, srv, e := setupCostTest(t, now)
-	srv.set(http.StatusOK, CostsList{Object: "page"})
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(today, costResult("proj-a", 1))}})
 
 	require.NoError(t, e.updateTodayCost())
 	require.Len(t, srv.queries, 1)
 	q := srv.queries[0]
 	assert.Equal(t, "/v1/organization/costs", srv.paths[0])
-	assert.Equal(t, strconv.FormatInt(time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC).Unix(), 10), q.Get("start_time"))
-	assert.Equal(t, strconv.FormatInt(now.Unix(), 10), q.Get("end_time"))
+	assert.Equal(t, strconv.FormatInt(today.Unix(), 10), q.Get("start_time"))
+	// end_time = end of the day bucket; end_time = now makes the real API return no bucket.
+	assert.Equal(t, strconv.FormatInt(today.Add(24*time.Hour).Unix(), 10), q.Get("end_time"))
 	assert.Equal(t, "1d", q.Get("bucket_width"))
 	assert.Equal(t, "project_id", q.Get("group_by"))
 }
 
-func TestUpdateTodayCost_AtMidnightUsesNonEmptyRange(t *testing.T) {
+func TestUpdateTodayCost_AtMidnightQueriesWholeDay(t *testing.T) {
 	midnight := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
 	_, srv, e := setupCostTest(t, midnight)
-	srv.set(http.StatusOK, CostsList{Object: "page"})
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(midnight)}})
 
 	require.NoError(t, e.updateTodayCost())
 	q := srv.queries[0]
 	assert.Equal(t, strconv.FormatInt(midnight.Unix(), 10), q.Get("start_time"))
-	assert.Equal(t, strconv.FormatInt(midnight.Unix()+1, 10), q.Get("end_time"))
+	assert.Equal(t, strconv.FormatInt(midnight.Add(24*time.Hour).Unix(), 10), q.Get("end_time"))
+}
+
+func TestUpdateTodayCost_NoTodayBucketKeepsPreviousValues(t *testing.T) {
+	now := time.Date(2026, time.June, 17, 13, 0, 0, 0, time.UTC)
+	today := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
+	_, srv, e := setupCostTest(t, now)
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(today, costResult("proj-a", 4))}})
+	require.NoError(t, e.updateTodayCost())
+
+	for _, resp := range []CostsList{
+		{Object: "page"}, // what the API returned for end_time = now
+		{Object: "page", Data: []CostBucket{costBucket(today.Add(-24*time.Hour), costResult("proj-a", 9))}},
+	} {
+		srv.set(http.StatusOK, resp)
+		err := e.updateTodayCost()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no bucket for 2026-06-17")
+		assert.InDelta(t, 4.0, gaugeVecValue(todayCostUSD, costLabels("proj-a")), 0.001)
+	}
 }
 
 func TestUpdateTodayCost_UsesOnlyTodaysBucket(t *testing.T) {
@@ -1300,7 +1322,8 @@ func TestCollectCost_RefreshesOnInterval(t *testing.T) {
 	setFlag(t, costInterval, 5*time.Minute)
 	start := time.Date(2026, time.June, 17, 12, 0, 0, 0, time.UTC)
 	clock, srv, e := setupCostTest(t, start)
-	srv.set(http.StatusOK, CostsList{Object: "page"})
+	day := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(day, costResult("proj-a", 1))}})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1311,10 +1334,11 @@ func TestCollectCost_RefreshesOnInterval(t *testing.T) {
 	}
 	e.collectCost(ctx)
 
-	// Fetches at 12:00, 12:05, 12:10, 12:15; end_time follows the clock each time.
+	// Fetches at 12:00, 12:05, 12:10, 12:15, each for the whole current UTC day bucket.
 	require.Len(t, srv.queries, 4)
-	for i, q := range srv.queries {
-		assert.Equal(t, strconv.FormatInt(start.Add(time.Duration(i)*5*time.Minute).Unix(), 10), q.Get("end_time"))
+	for _, q := range srv.queries {
+		assert.Equal(t, strconv.FormatInt(day.Unix(), 10), q.Get("start_time"))
+		assert.Equal(t, strconv.FormatInt(day.Add(24*time.Hour).Unix(), 10), q.Get("end_time"))
 	}
 }
 
@@ -1367,4 +1391,30 @@ func TestCollectUsage_StuckClockDoesNotSpin(t *testing.T) {
 	for _, d := range sleeps {
 		assert.GreaterOrEqual(t, d, minUsageLoopSleep)
 	}
+}
+
+func TestUsageEndpoints_GroupByMatchesAPI(t *testing.T) {
+	got := map[string]string{}
+	for _, ep := range usageEndpoints {
+		got[ep.Path] = ep.GroupBy
+	}
+	// The usage API returns 400 "Invalid group_by value: batch" for every endpoint but completions.
+	assert.Equal(t, "project_id,user_id,api_key_id,model,batch", got["completions"])
+	assert.Equal(t, "project_id", got["vector_stores"])
+	for _, p := range []string{"embeddings", "moderations", "images", "audio_speeches", "audio_transcriptions"} {
+		assert.Equal(t, defaultUsageGroupBy, got[p], p)
+		assert.NotContains(t, got[p], "batch", p)
+	}
+}
+
+func TestFetchUsageData_SendsEndpointGroupBy(t *testing.T) {
+	var seen string
+	e := newTestExporter(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.URL.Query().Get("group_by")
+		_, _ = w.Write([]byte(`{"object":"page","data":[],"has_more":false}`))
+	}))
+	require.NoError(t, e.fetchUsageData(UsageEndpoint{Path: "vector_stores", Name: "vector_stores", GroupBy: "project_id"}, 1000, 2000))
+	assert.Equal(t, "project_id", seen)
+	require.NoError(t, e.fetchUsageData(UsageEndpoint{Path: "embeddings", Name: "embeddings"}, 1000, 2000))
+	assert.Equal(t, defaultUsageGroupBy, seen, "empty GroupBy falls back to the default")
 }
