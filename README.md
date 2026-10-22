@@ -54,7 +54,7 @@ Use the following flags to customize the behavior:
 * `-web.listen-address`: Set the listen address for the web interface and telemetry (default: `:9185`).
 * `-web.telemetry-path`: Set the path under which to expose metrics (default: `/metrics`).
 * `-scrape.interval`: Set the interval for API calls and the size of each usage window (default: `1m`). Must be a whole number of seconds.
-* `-scrape.settle-delay`: How long after a usage window has ended before it is fetched, because OpenAI usage buckets can arrive late (default: `1m`).
+* `-scrape.settle-delay`: How long after a usage window has ended before it is fetched, because OpenAI usage buckets keep growing for ~15-20 minutes after the minute ends and each window is fetched only once (default: `25m`; token metrics lag real time by about this much).
 * `-scrape.max-catchup-windows`: Maximum number of usage windows fetched in one collection cycle when the collector is behind (default: `60`).
 * `-scrape.catchup-spacing`: Minimum time between the starts of consecutive usage window fetches; keeps catch-up under the OpenAI rate limit (default: `20s`, must not exceed `-scrape.interval`).
 * `-cost.interval`: Interval for refreshing today's cost (default: `5m`).

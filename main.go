@@ -125,9 +125,9 @@ var (
 	metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
 	// API polling interval; also the size of each usage time window.
 	scrapeInterval = flag.Duration("scrape.interval", 1*time.Minute, "Interval for API calls and usage data window")
-	// Usage buckets can show up in the API a little after their minute has ended, so a window
-	// is only fetched once it has been closed for at least this long.
-	scrapeSettleDelay = flag.Duration("scrape.settle-delay", 1*time.Minute, "How long after a usage window has ended before it is fetched")
+	// OpenAI usage buckets keep growing for ~15-20 min after their minute ends (measured
+	// 2026-10-22), and each window is fetched only once, so wait until it has settled.
+	scrapeSettleDelay = flag.Duration("scrape.settle-delay", 25*time.Minute, "How long after a usage window has ended before it is fetched")
 	scrapeMaxCatchup  = flag.Int("scrape.max-catchup-windows", 60, "Maximum number of usage windows fetched in one collection cycle when behind")
 	// Every usage window costs one request per usage endpoint, so the spacing bounds the request rate while catching up.
 	scrapeCatchupSpacing = flag.Duration("scrape.catchup-spacing", 20*time.Second, "Minimum time between the starts of consecutive usage window fetches (rate-limit guard while catching up)")
