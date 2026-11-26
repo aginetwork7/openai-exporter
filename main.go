@@ -163,11 +163,18 @@ var (
 		},
 		[]string{"project_id", "project_name", "line_item", "organization_id", "currency"},
 	)
+	costLastSuccess = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "openai_api_cost_last_success_timestamp_seconds",
+			Help: "Unix time (seconds) of the last successful refresh of openai_api_today_cost.",
+		},
+	)
 )
 
 func init() {
 	prometheus.MustRegister(tokensTotal)
 	prometheus.MustRegister(todayCostUSD)
+	prometheus.MustRegister(costLastSuccess)
 }
 
 func setupLogging() {
@@ -574,11 +581,36 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) ([]CostBucket, error)
 
 // updateTodayCost fetches the current UTC day's cost bucket and publishes it in todayCostUSD.
 // The query window is always [today 00:00 UTC, now), independent of the usage collection window.
-// On error the gauge keeps its previous values. When the UTC day changes, the gauge vec is
-// reset before writing so projects that spent yesterday but not today disappear.
+// On error the gauge keeps its previous values only while they are still for the current UTC
+// day; once the day has changed they are cleared, so yesterday's total is never shown as today's.
+// When the UTC day changes, the gauge vec is reset before writing so projects that spent
+// yesterday but not today disappear. On success costLastSuccess is set to the current time.
 func (e *Exporter) updateTodayCost() error {
 	now := utcNow().UTC()
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	today := dayStart.Format("2006-01-02")
+	if err := e.refreshTodayCost(now, dayStart, today); err != nil {
+		clearStaleCost(today, err)
+		return err
+	}
+	return nil
+}
+
+// clearStaleCost runs after a failed cost fetch: values from an earlier UTC day are no longer
+// "today's" cost, so they are removed instead of being kept until a fetch succeeds.
+func clearStaleCost(today string, err error) {
+	costMu.Lock()
+	defer costMu.Unlock()
+	if costDay == "" || costDay == today {
+		return
+	}
+	logrus.WithError(err).Warnf("UTC day changed from %s to %s and the cost fetch failed, clearing %s", costDay, today, "openai_api_today_cost")
+	todayCostUSD.Reset()
+	costDay = ""
+}
+
+// refreshTodayCost fetches today's cost bucket and publishes it; see updateTodayCost.
+func (e *Exporter) refreshTodayCost(now, dayStart time.Time, today string) error {
 	// The range must cover the whole 1d bucket: with end_time = now the costs API returns no
 	// bucket at all for the current day. The bucket still only holds spend up to now.
 	endTime := dayStart.Add(24 * time.Hour).Unix()
@@ -592,7 +624,6 @@ func (e *Exporter) updateTodayCost() error {
 		labels prometheus.Labels
 		value  float64
 	}
-	today := dayStart.Format("2006-01-02")
 	var points []costPoint
 	foundToday := false
 	for _, bucket := range buckets {
@@ -622,7 +653,8 @@ func (e *Exporter) updateTodayCost() error {
 	}
 
 	// No bucket for today means the response is unusable (not "zero spend": the API returns
-	// today's bucket with empty results then); keep the previous values instead of wiping them.
+	// today's bucket with empty results then); keep the previous values (if still for today)
+	// instead of wiping them.
 	if !foundToday {
 		return fmt.Errorf("cost response has no bucket for %s (%d buckets)", today, len(buckets))
 	}
@@ -639,6 +671,7 @@ func (e *Exporter) updateTodayCost() error {
 	for _, p := range points {
 		todayCostUSD.With(p.labels).Set(p.value)
 	}
+	costLastSuccess.Set(float64(now.Unix()))
 	return nil
 }
 
@@ -655,24 +688,35 @@ func costRetryDelay(failures int) time.Duration {
 	return min(d, *costRetryMax)
 }
 
+// nextCostWait shortens wait so the next cost fetch happens at most one minute after the next
+// UTC midnight; otherwise yesterday's total would stay on the gauge for up to a whole wait.
+func nextCostWait(now time.Time, wait time.Duration) time.Duration {
+	now = now.UTC()
+	nextMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
+	return min(wait, nextMidnight.Sub(now)+time.Minute)
+}
+
 // collectCost refreshes today's cost every cost.interval until ctx is cancelled.
-// Failed fetches (e.g. 429 rate limit) are retried with exponential backoff.
+// Failed fetches (e.g. 429 rate limit) are retried with exponential backoff. Either wait is
+// cut short so a fetch happens shortly after every UTC midnight.
 func (e *Exporter) collectCost(ctx context.Context) {
 	failures := 0
 	for {
-		wait := *costInterval
 		if err := e.updateTodayCost(); err != nil {
 			failures++
-			wait = costRetryDelay(failures)
+			wait := nextCostWait(utcNow(), costRetryDelay(failures))
 			logrus.WithError(err).WithField("consecutive_failures", failures).
-				Warnf("Error fetching cost data, keeping previous values; retrying in %s", wait)
-		} else {
-			if failures > 0 {
-				logrus.Infof("Cost fetch recovered after %d consecutive failures", failures)
+				Warnf("Error fetching cost data, keeping today's previous values; retrying in %s", wait)
+			if err := sleepCtx(ctx, wait); err != nil {
+				return
 			}
-			failures = 0
+			continue
 		}
-		if err := sleepCtx(ctx, wait); err != nil {
+		if failures > 0 {
+			logrus.Infof("Cost fetch recovered after %d consecutive failures", failures)
+		}
+		failures = 0
+		if err := sleepCtx(ctx, nextCostWait(utcNow(), *costInterval)); err != nil {
 			return
 		}
 	}

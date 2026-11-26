@@ -1296,7 +1296,7 @@ func TestUpdateTodayCost_DayRolloverResetsGauge(t *testing.T) {
 	assert.Equal(t, strconv.FormatInt(day2.Unix(), 10), srv.queries[len(srv.queries)-1].Get("start_time"))
 }
 
-func TestUpdateTodayCost_ErrorKeepsPreviousValues(t *testing.T) {
+func TestUpdateTodayCost_ErrorKeepsTodaysPreviousValues(t *testing.T) {
 	day1 := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
 	clock, srv, e := setupCostTest(t, day1.Add(12*time.Hour))
 	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{
@@ -1315,11 +1315,122 @@ func TestUpdateTodayCost_ErrorKeepsPreviousValues(t *testing.T) {
 	require.Error(t, e.updateTodayCost())
 	assert.Len(t, gaugeVecSeries(todayCostUSD), 1)
 
-	// Errors across the day boundary keep the previous values until a fetch succeeds.
+	// Once the UTC day has changed, a failed fetch clears yesterday's values instead of
+	// presenting them as today's.
 	clock.Advance(13 * time.Hour)
 	srv.set(http.StatusInternalServerError, CostsList{})
 	require.Error(t, e.updateTodayCost())
-	assert.InDelta(t, 7.0, gaugeVecValue(todayCostUSD, costLabels("proj-a")), 0.001)
+	assert.Empty(t, gaugeVecSeries(todayCostUSD))
+}
+
+func TestUpdateTodayCost_DayChangeWithoutTodayBucketClearsGauge(t *testing.T) {
+	day1 := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
+	clock, srv, e := setupCostTest(t, day1.Add(23*time.Hour+50*time.Minute))
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(day1, costResult("proj-a", 700))}})
+	require.NoError(t, e.updateTodayCost())
+
+	// After midnight the response still only has yesterday's bucket: the error path clears it.
+	clock.Advance(20 * time.Minute)
+	err := e.updateTodayCost()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no bucket for 2026-06-18")
+	assert.Empty(t, gaugeVecSeries(todayCostUSD))
+
+	// Further failures on the new day keep it empty and do not panic on the cleared state.
+	srv.set(http.StatusTooManyRequests, CostsList{})
+	require.Error(t, e.updateTodayCost())
+	assert.Empty(t, gaugeVecSeries(todayCostUSD))
+
+	// The next successful fetch publishes the new day's values normally.
+	day2 := day1.Add(24 * time.Hour)
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(day2, costResult("proj-b", 1.25))}})
+	require.NoError(t, e.updateTodayCost())
+	series := gaugeVecSeries(todayCostUSD)
+	require.Len(t, series, 1)
+	assert.InDelta(t, 1.25, gaugeVecValue(todayCostUSD, costLabels("proj-b")), 0.001)
+
+	// And a later same-day failure keeps them again.
+	srv.set(http.StatusInternalServerError, CostsList{})
+	require.Error(t, e.updateTodayCost())
+	assert.InDelta(t, 1.25, gaugeVecValue(todayCostUSD, costLabels("proj-b")), 0.001)
+}
+
+// gaugeValue returns the current value of a plain Gauge.
+func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, g.Write(&m))
+	return m.GetGauge().GetValue()
+}
+
+func TestUpdateTodayCost_SetsLastSuccessTimestampOnlyOnSuccess(t *testing.T) {
+	day := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
+	first := day.Add(12 * time.Hour)
+	clock, srv, e := setupCostTest(t, first)
+	old := gaugeValue(t, costLastSuccess)
+	t.Cleanup(func() { costLastSuccess.Set(old) })
+	costLastSuccess.Set(0)
+
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(day, costResult("proj-a", 2))}})
+	require.NoError(t, e.updateTodayCost())
+	assert.Equal(t, float64(first.Unix()), gaugeValue(t, costLastSuccess))
+
+	clock.Advance(10 * time.Minute)
+	srv.set(http.StatusTooManyRequests, CostsList{})
+	require.Error(t, e.updateTodayCost())
+	srv.set(http.StatusOK, CostsList{Object: "page"}) // no bucket for today
+	require.Error(t, e.updateTodayCost())
+	assert.Equal(t, float64(first.Unix()), gaugeValue(t, costLastSuccess), "failures must not move the timestamp")
+
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(day, costResult("proj-a", 3))}})
+	require.NoError(t, e.updateTodayCost())
+	assert.Equal(t, float64(first.Add(10*time.Minute).Unix()), gaugeValue(t, costLastSuccess))
+}
+
+func TestNextCostWait_FetchesSoonAfterUTCMidnight(t *testing.T) {
+	day := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
+	// 23:50 + 30m would skip past midnight: wait until 00:01 instead.
+	assert.Equal(t, 11*time.Minute, nextCostWait(day.Add(23*time.Hour+50*time.Minute), 30*time.Minute))
+	// Midday: the normal interval is untouched.
+	assert.Equal(t, 30*time.Minute, nextCostWait(day.Add(12*time.Hour), 30*time.Minute))
+	// A short backoff shorter than the time to 00:01 is kept as is.
+	assert.Equal(t, time.Minute, nextCostWait(day.Add(23*time.Hour+59*time.Minute+30*time.Second), time.Minute))
+	// Exactly at midnight the next fetch is still a full interval away at most.
+	assert.Equal(t, 30*time.Minute, nextCostWait(day, 30*time.Minute))
+	// Non-UTC input is evaluated against UTC midnight.
+	tz := time.FixedZone("UTC+8", 8*3600)
+	assert.Equal(t, 11*time.Minute, nextCostWait(day.Add(23*time.Hour+50*time.Minute).In(tz), 30*time.Minute))
+}
+
+func TestCollectCost_ShortensWaitAcrossUTCMidnight(t *testing.T) {
+	setFlag(t, costInterval, 30*time.Minute)
+	day1 := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
+	day2 := day1.Add(24 * time.Hour)
+	start := day1.Add(23*time.Hour + 40*time.Minute)
+	clock, srv, e := setupCostTest(t, start)
+	srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{
+		costBucket(day1, costResult("proj-a", 5)),
+		costBucket(day2, costResult("proj-a", 0.5)),
+	}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var sleeps []time.Duration
+	last := start
+	clock.onSleep = func(now time.Time) {
+		sleeps = append(sleeps, now.Sub(last))
+		last = now
+		if len(sleeps) == 3 {
+			cancel()
+		}
+	}
+	e.collectCost(ctx)
+
+	// 23:40 -> 00:01 (21m), then the normal 30m interval again.
+	assert.Equal(t, []time.Duration{21 * time.Minute, 30 * time.Minute, 30 * time.Minute}, sleeps)
+	require.Len(t, srv.queries, 3)
+	assert.Equal(t, strconv.FormatInt(day2.Unix(), 10), srv.queries[1].Get("start_time"))
+	assert.InDelta(t, 0.5, gaugeVecValue(todayCostUSD, costLabels("proj-a")), 0.001)
 }
 
 func TestCollectCost_RefreshesOnInterval(t *testing.T) {
