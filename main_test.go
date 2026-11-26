@@ -1079,7 +1079,9 @@ func TestInitialWindowStart(t *testing.T) {
 
 func TestValidateFlags(t *testing.T) {
 	setDefaultCollectFlags(t)
-	setFlag(t, costInterval, 5*time.Minute)
+	setFlag(t, costInterval, 30*time.Minute)
+	setFlag(t, costRetryInitial, time.Minute)
+	setFlag(t, costRetryMax, 30*time.Minute)
 	setFlag(t, httpTimeout, 30*time.Second)
 	require.NoError(t, validateFlags())
 
@@ -1093,6 +1095,8 @@ func TestValidateFlags(t *testing.T) {
 		{"zero spacing", func(t *testing.T) { setFlag(t, scrapeCatchupSpacing, 0) }},
 		{"spacing above interval", func(t *testing.T) { setFlag(t, scrapeCatchupSpacing, 2*time.Minute) }},
 		{"zero cost interval", func(t *testing.T) { setFlag(t, costInterval, 0) }},
+		{"zero cost retry initial", func(t *testing.T) { setFlag(t, costRetryInitial, 0) }},
+		{"cost retry max below initial", func(t *testing.T) { setFlag(t, costRetryMax, 30*time.Second) }},
 		{"zero http timeout", func(t *testing.T) { setFlag(t, httpTimeout, 0) }},
 	}
 	for _, tt := range tests {
@@ -1340,6 +1344,48 @@ func TestCollectCost_RefreshesOnInterval(t *testing.T) {
 		assert.Equal(t, strconv.FormatInt(day.Unix(), 10), q.Get("start_time"))
 		assert.Equal(t, strconv.FormatInt(day.Add(24*time.Hour).Unix(), 10), q.Get("end_time"))
 	}
+}
+
+func TestCostRetryDelay_ExponentialAndCapped(t *testing.T) {
+	setFlag(t, costRetryInitial, time.Minute)
+	setFlag(t, costRetryMax, 30*time.Minute)
+	want := []time.Duration{1, 2, 4, 8, 16, 30, 30}
+	for i, w := range want {
+		assert.Equal(t, w*time.Minute, costRetryDelay(i+1), "failures=%d", i+1)
+	}
+	// Very long failure streaks must not overflow.
+	assert.Equal(t, 30*time.Minute, costRetryDelay(1000))
+}
+
+func TestCollectCost_BacksOffOnRateLimitThenReturnsToInterval(t *testing.T) {
+	setFlag(t, costInterval, 30*time.Minute)
+	setFlag(t, costRetryInitial, time.Minute)
+	setFlag(t, costRetryMax, 30*time.Minute)
+	start := time.Date(2026, time.June, 17, 12, 0, 0, 0, time.UTC)
+	clock, srv, e := setupCostTest(t, start)
+	day := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC)
+	srv.set(http.StatusTooManyRequests, CostsList{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var sleeps []time.Duration
+	last := start
+	clock.onSleep = func(now time.Time) {
+		sleeps = append(sleeps, now.Sub(last))
+		last = now
+		switch len(sleeps) {
+		case 3: // after three 429s, the API recovers
+			srv.set(http.StatusOK, CostsList{Object: "page", Data: []CostBucket{costBucket(day, costResult("proj-a", 3))}})
+		case 5:
+			cancel()
+		}
+	}
+	e.collectCost(ctx)
+
+	// 429, 429, 429 back off 1m, 2m, 4m; then successes wait the full interval.
+	assert.Equal(t, []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 30 * time.Minute, 30 * time.Minute}, sleeps)
+	assert.Len(t, srv.queries, 5)
+	assert.InDelta(t, 3.0, gaugeVecValue(todayCostUSD, costLabels("proj-a")), 0.001)
 }
 
 func TestCollectUsage_StuckClockDoesNotSpin(t *testing.T) {

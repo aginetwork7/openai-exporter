@@ -57,7 +57,9 @@ Use the following flags to customize the behavior:
 * `-scrape.settle-delay`: How long after a usage window has ended before it is fetched, because OpenAI usage buckets keep growing for ~15-20 minutes after the minute ends and each window is fetched only once (default: `25m`; token metrics lag real time by about this much).
 * `-scrape.max-catchup-windows`: Maximum number of usage windows fetched in one collection cycle when the collector is behind (default: `60`).
 * `-scrape.catchup-spacing`: Minimum time between the starts of consecutive usage window fetches; keeps catch-up under the OpenAI rate limit (default: `20s`, must not exceed `-scrape.interval`).
-* `-cost.interval`: Interval for refreshing today's cost (default: `5m`).
+* `-cost.interval`: Interval for refreshing today's cost (default: `30m`). `/organization/costs` is rate limited per organization, so keep it infrequent.
+* `-cost.retry-initial`: Delay before retrying a failed cost fetch, e.g. after a `429` (default: `1m`). It doubles on every consecutive failure.
+* `-cost.retry-max`: Upper bound for the cost retry delay (default: `30m`, must not be below `-cost.retry-initial`).
 * `-http.timeout`: Timeout for each OpenAI API request (default: `30s`).
 * `-log.level`: Set the log verbosity (default: `info`).
 

@@ -131,9 +131,13 @@ var (
 	scrapeMaxCatchup  = flag.Int("scrape.max-catchup-windows", 60, "Maximum number of usage windows fetched in one collection cycle when behind")
 	// Every usage window costs one request per usage endpoint, so the spacing bounds the request rate while catching up.
 	scrapeCatchupSpacing = flag.Duration("scrape.catchup-spacing", 20*time.Second, "Minimum time between the starts of consecutive usage window fetches (rate-limit guard while catching up)")
-	costInterval         = flag.Duration("cost.interval", 5*time.Minute, "Interval for fetching today's cost")
-	httpTimeout          = flag.Duration("http.timeout", 30*time.Second, "Timeout for each OpenAI API request")
-	logLevel             = flag.String("log.level", "info", "Log level")
+	// Today's cost changes slowly and /organization/costs is rate limited per organization, so poll it rarely.
+	costInterval = flag.Duration("cost.interval", 30*time.Minute, "Interval for fetching today's cost")
+	// After a failed cost fetch, retry after cost.retry-initial, doubling on every consecutive failure up to cost.retry-max.
+	costRetryInitial = flag.Duration("cost.retry-initial", 1*time.Minute, "Delay before the first retry after a failed cost fetch; doubles on every consecutive failure")
+	costRetryMax     = flag.Duration("cost.retry-max", 30*time.Minute, "Upper bound for the cost fetch retry delay")
+	httpTimeout      = flag.Duration("http.timeout", 30*time.Second, "Timeout for each OpenAI API request")
+	logLevel         = flag.String("log.level", "info", "Log level")
 
 	usageEndpoints = []UsageEndpoint{
 		{Path: "completions", Name: "completions", GroupBy: defaultUsageGroupBy + ",batch"},
@@ -638,13 +642,37 @@ func (e *Exporter) updateTodayCost() error {
 	return nil
 }
 
-// collectCost refreshes today's cost every cost.interval until ctx is cancelled.
-func (e *Exporter) collectCost(ctx context.Context) {
-	for {
-		if err := e.updateTodayCost(); err != nil {
-			logrus.WithError(err).Warn("Error fetching cost data, keeping previous values")
+// costRetryDelay returns the wait before the next cost fetch after the given number of
+// consecutive failures (>= 1): cost.retry-initial doubled per extra failure, capped at cost.retry-max.
+func costRetryDelay(failures int) time.Duration {
+	d := *costRetryInitial
+	for i := 1; i < failures; i++ {
+		if d >= *costRetryMax/2 {
+			return *costRetryMax
 		}
-		if err := sleepCtx(ctx, *costInterval); err != nil {
+		d *= 2
+	}
+	return min(d, *costRetryMax)
+}
+
+// collectCost refreshes today's cost every cost.interval until ctx is cancelled.
+// Failed fetches (e.g. 429 rate limit) are retried with exponential backoff.
+func (e *Exporter) collectCost(ctx context.Context) {
+	failures := 0
+	for {
+		wait := *costInterval
+		if err := e.updateTodayCost(); err != nil {
+			failures++
+			wait = costRetryDelay(failures)
+			logrus.WithError(err).WithField("consecutive_failures", failures).
+				Warnf("Error fetching cost data, keeping previous values; retrying in %s", wait)
+		} else {
+			if failures > 0 {
+				logrus.Infof("Cost fetch recovered after %d consecutive failures", failures)
+			}
+			failures = 0
+		}
+		if err := sleepCtx(ctx, wait); err != nil {
 			return
 		}
 	}
@@ -679,6 +707,12 @@ func validateFlags() error {
 	}
 	if *costInterval <= 0 {
 		return fmt.Errorf("-cost.interval must be positive, got %s", *costInterval)
+	}
+	if *costRetryInitial <= 0 {
+		return fmt.Errorf("-cost.retry-initial must be positive, got %s", *costRetryInitial)
+	}
+	if *costRetryMax < *costRetryInitial {
+		return fmt.Errorf("-cost.retry-max (%s) must not be below -cost.retry-initial (%s)", *costRetryMax, *costRetryInitial)
 	}
 	if *httpTimeout <= 0 {
 		return fmt.Errorf("-http.timeout must be positive, got %s", *httpTimeout)
